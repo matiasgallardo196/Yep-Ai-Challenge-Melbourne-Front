@@ -1,20 +1,25 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Plus, Pencil, Trash2, Search, ChevronLeft, ChevronRight } from 'lucide-react';
-import { type Employee, type CreateEmployeeDto, type EmployeeAvailability, EmploymentType, EmployeeRole, type Store, type Station } from '../types';
+import { type Employee, type CreateEmployeeDto, type EmployeeAvailability, type ShiftCode, EmploymentType, EmployeeRole, type Store, type Station, type SchedulePeriod } from '../types';
 import * as employeeService from '../services/employeeService';
 import * as availabilityService from '../services/availabilityService';
 import * as storeService from '../services/storeService';
 import * as stationService from '../services/stationService';
+import * as shiftCodeService from '../services/shiftCodeService';
+import * as schedulePeriodService from '../services/schedulePeriodService';
 import Button from '../components/Button';
 import Input from '../components/Input';
 import Modal from '../components/Modal';
 import Tooltip from '../components/Tooltip';
+
 
 export default function Employees() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [allAvailabilities, setAllAvailabilities] = useState<EmployeeAvailability[]>([]);
   const [stores, setStores] = useState<Store[]>([]);
   const [stations, setStations] = useState<Station[]>([]);
+  const [shiftCodes, setShiftCodes] = useState<ShiftCode[]>([]);
+  const [schedulePeriods, setSchedulePeriods] = useState<SchedulePeriod[]>([]);
   
   const [isLoading, setIsLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -26,9 +31,10 @@ export default function Employees() {
   const [filterStation, setFilterStation] = useState<string>('');
   const [filterRole, setFilterRole] = useState<string>('');
   
-  // Availability Modal State
-  const [isAvailabilityModalOpen, setIsAvailabilityModalOpen] = useState(false);
-  const [selectedEmployeeForAvailability, setSelectedEmployeeForAvailability] = useState<Employee | null>(null);
+  // Inline cell editing state
+  const [editingCell, setEditingCell] = useState<{ employeeId: string; date: string } | null>(null);
+  const [isSavingAvailability, setIsSavingAvailability] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
   
   // Week navigation state - Start with Dec 9, 2024 (first week in seeder)
   const [currentWeekStart, setCurrentWeekStart] = useState<Date>(() => {
@@ -51,11 +57,13 @@ export default function Employees() {
   const fetchData = async () => {
     try {
       setIsLoading(true);
-      const [employeesData, availabilitiesData, storesData, stationsData] = await Promise.all([
+      const [employeesData, availabilitiesData, storesData, stationsData, shiftCodesData, schedulePeriodsData] = await Promise.all([
         employeeService.getEmployees(),
         availabilityService.getAvailabilities(),
         storeService.getStores(),
-        stationService.getStations()
+        stationService.getStations(),
+        shiftCodeService.getShiftCodes(),
+        schedulePeriodService.getSchedulePeriods()
       ]);
 
       if (Array.isArray(employeesData)) setEmployees(employeesData);
@@ -73,6 +81,8 @@ export default function Employees() {
       }
       
       if (Array.isArray(stationsData)) setStations(stationsData);
+      if (Array.isArray(shiftCodesData)) setShiftCodes(shiftCodesData);
+      if (Array.isArray(schedulePeriodsData)) setSchedulePeriods(schedulePeriodsData);
 
     } catch (error) {
       console.error('Failed to fetch data', error);
@@ -195,9 +205,86 @@ export default function Employees() {
     );
   };
 
+  // Handle availability change for a cell
+  const handleAvailabilityChange = async (employee: Employee, date: Date, shiftCodeId: string | null) => {
+    const dateStr = date.toISOString().split('T')[0];
+    const existingAvailability = getAvailabilityForDate(employee, date);
+    
+    console.log('handleAvailabilityChange called:', { employeeId: employee.id, dateStr, shiftCodeId, existingAvailability: existingAvailability?.id });
+    
+    setIsSavingAvailability(true);
+    try {
+      if (shiftCodeId === null && existingAvailability) {
+        // Delete availability
+        console.log('Deleting availability:', existingAvailability.id);
+        await availabilityService.deleteAvailability(existingAvailability.id);
+      } else if (shiftCodeId && existingAvailability) {
+        // Update existing availability
+        console.log('Updating availability:', existingAvailability.id, 'with shiftCodeId:', shiftCodeId);
+        await availabilityService.updateAvailability(existingAvailability.id, {
+          shiftCodeId
+        });
+      } else if (shiftCodeId && !existingAvailability) {
+        // Create new availability - find schedule period or use first available
+        let schedulePeriod = schedulePeriods.find(sp => {
+          const spStart = new Date(sp.startDate);
+          const spEnd = new Date(sp.endDate);
+          const d = new Date(dateStr);
+          return d >= spStart && d <= spEnd;
+        });
+        
+        // Fallback: use first active schedule period if none matches
+        if (!schedulePeriod && schedulePeriods.length > 0) {
+          console.log('No matching schedule period, using first available');
+          schedulePeriod = schedulePeriods[0];
+        }
+        
+        if (!schedulePeriod) {
+          alert('No schedule period available. Please create one first.');
+          return;
+        }
+        
+        console.log('Creating availability with schedulePeriodId:', schedulePeriod.id);
+        await availabilityService.createAvailability({
+          employeeId: employee.id,
+          schedulePeriodId: schedulePeriod.id,
+          storeId: employee.defaultStoreId,
+          date: dateStr,
+          shiftCodeId,
+          stationId: employee.defaultStationId
+        });
+      }
+      
+      // Refresh availabilities
+      const availabilitiesData = await availabilityService.getAvailabilities();
+      if (Array.isArray(availabilitiesData)) setAllAvailabilities(availabilitiesData);
+      
+    } catch (error) {
+      console.error('Failed to update availability:', error);
+      alert('Failed to update availability. Check console for details.');
+    } finally {
+      setIsSavingAvailability(false);
+      setEditingCell(null);
+    }
+  };
+
+
+  // Click outside to close dropdown
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setEditingCell(null);
+      }
+    };
+    
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
   const weekDays = getWeekDays(currentWeekStart);
 
   return (
+
     <div>
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl font-bold text-gray-900">Employees</h1>
@@ -332,16 +419,54 @@ export default function Employees() {
                         </Tooltip>
                         <div className="text-xs text-gray-500 mt-1">{employee.defaultStation?.name || 'No Station'}</div>
                       </td>
-                      {weekDays.map((_, dayIndex) => {
+                      {weekDays.map((day, dayIndex) => {
                         const availability = employeeWeekAvailabilities[dayIndex];
+                        const dateStr = day.toISOString().split('T')[0];
+                        const isEditing = editingCell?.employeeId === employee.id && editingCell?.date === dateStr;
+                        
                         return (
                           <td
                             key={dayIndex}
-                            className="border border-gray-300 px-2 py-3 text-center text-xs"
+                            className={`border border-gray-300 px-2 py-3 text-center text-xs relative cursor-pointer hover:bg-indigo-50 transition-colors ${isSavingAvailability && isEditing ? 'opacity-50' : ''}`}
+                            onClick={() => {
+                              if (!isSavingAvailability) {
+                                setEditingCell({ employeeId: employee.id, date: dateStr });
+                              }
+                            }}
                           >
+                            {isEditing ? (
+                              <div 
+                                ref={dropdownRef}
+                                className="absolute top-full left-0 z-50 mt-1 w-40 bg-white border border-gray-300 rounded-md shadow-lg max-h-48 overflow-y-auto"
+                              >
+                                <button
+                                  className="w-full px-3 py-2 text-left text-xs hover:bg-gray-100 text-gray-500 border-b"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleAvailabilityChange(employee, day, null);
+                                  }}
+                                >
+                                  ✕ Clear
+                                </button>
+                                {shiftCodes.filter(sc => sc.isActive && sc.isAvailable).map(sc => (
+                                  <button
+                                    key={sc.id}
+                                    className={`w-full px-3 py-2 text-left text-xs hover:bg-indigo-50 ${availability?.shiftCode?.id === sc.id ? 'bg-indigo-100 font-semibold' : ''}`}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleAvailabilityChange(employee, day, sc.id);
+                                    }}
+                                  >
+                                    <span className="font-semibold">{sc.code}</span>
+                                    <span className="text-gray-500 ml-1">({sc.hours}h)</span>
+                                  </button>
+                                ))}
+                              </div>
+                            ) : null}
+                            
                             {availability ? (
                               <div className="flex flex-col items-center justify-center space-y-1">
-                                <span className="font-semibold text-gray-900">
+                                <span className="font-semibold text-indigo-600">
                                   {availability.shiftCode?.code || 'N/A'}
                                 </span>
                                 {availability.store && (
@@ -356,11 +481,12 @@ export default function Employees() {
                                 )}
                               </div>
                             ) : (
-                              <span className="text-gray-400">-</span>
+                              <span className="text-gray-400 hover:text-indigo-400">+ Add</span>
                             )}
                           </td>
                         );
                       })}
+
                       <td className="border border-gray-300 px-2 py-3 text-center">
                         <div className="flex items-center justify-center gap-2">
                           <button 
@@ -482,113 +608,7 @@ export default function Employees() {
           </div>
         </form>
       </Modal>
-
-      {/* Availability Modal - Shows only selected employee */}
-      <Modal
-        isOpen={isAvailabilityModalOpen}
-        onClose={() => setIsAvailabilityModalOpen(false)}
-        title={`Availability: ${selectedEmployeeForAvailability?.firstName} ${selectedEmployeeForAvailability?.lastName}`}
-      >
-        <div className="mt-2">
-          {/* Week Navigation */}
-          <div className="flex items-center justify-between mb-4">
-            <button
-              onClick={() => navigateWeek('prev')}
-              className="p-2 rounded-md hover:bg-gray-100 transition-colors"
-              aria-label="Previous week"
-            >
-              <ChevronLeft className="w-5 h-5" />
-            </button>
-            <div className="text-lg font-semibold text-gray-700">
-              {getWeekRange(currentWeekStart)}
-            </div>
-            <button
-              onClick={() => navigateWeek('next')}
-              className="p-2 rounded-md hover:bg-gray-100 transition-colors"
-              aria-label="Next week"
-            >
-              <ChevronRight className="w-5 h-5" />
-            </button>
-          </div>
-
-          {/* Single Employee Availability Grid */}
-          {selectedEmployeeForAvailability && (
-            <div className="overflow-x-auto border border-gray-300 rounded-lg">
-              <table className="min-w-full border-collapse">
-                <thead>
-                  <tr className="bg-gray-100">
-                    {weekDays.map((day, index) => (
-                      <th
-                        key={index}
-                        className="border border-gray-300 px-3 py-3 text-center text-xs font-medium text-gray-700 uppercase min-w-[100px]"
-                      >
-                        <div>{day.toLocaleDateString('en-US', { weekday: 'short' })}</div>
-                        <div className="text-xs font-normal text-gray-600">
-                          {day.toLocaleDateString('en-US', { day: 'numeric', month: 'short' })}
-                        </div>
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="bg-white">
-                  <tr>
-                    {weekDays.map((day, dayIndex) => {
-                      const availability = getAvailabilityForDate(selectedEmployeeForAvailability, day);
-                      return (
-                        <td
-                          key={dayIndex}
-                          className="border border-gray-300 px-2 py-4 text-center"
-                        >
-                          {availability ? (
-                            <div className="flex flex-col items-center justify-center space-y-1">
-                              <span className="font-bold text-lg text-indigo-600">
-                                {availability.shiftCode?.code || 'N/A'}
-                              </span>
-                              <span className="text-xs text-gray-600">
-                                {availability.shiftCode?.shiftName || ''}
-                              </span>
-                              {availability.store && (
-                                <span className="text-xs text-gray-500">
-                                  📍 {availability.store.name}
-                                </span>
-                              )}
-                              {availability.station && (
-                                <span className="text-xs text-gray-500">
-                                  🔧 {availability.station.name}
-                                </span>
-                              )}
-                            </div>
-                          ) : (
-                            <span className="text-gray-400 text-sm">Not available</span>
-                          )}
-                        </td>
-                      );
-                    })}
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {/* Employee Info */}
-          {selectedEmployeeForAvailability && (
-            <div className="mt-4 p-3 bg-gray-50 rounded-lg">
-              <div className="grid grid-cols-2 gap-2 text-sm">
-                <div><span className="font-medium">Role:</span> {selectedEmployeeForAvailability.role}</div>
-                <div><span className="font-medium">Type:</span> {selectedEmployeeForAvailability.employmentType}</div>
-                <div><span className="font-medium">Store:</span> {selectedEmployeeForAvailability.defaultStore?.name || 'N/A'}</div>
-                <div><span className="font-medium">Station:</span> {selectedEmployeeForAvailability.defaultStation?.name || 'N/A'}</div>
-              </div>
-            </div>
-          )}
-
-          <div className="flex justify-end mt-4">
-            <Button type="button" variant="secondary" onClick={() => setIsAvailabilityModalOpen(false)}>
-              Close
-            </Button>
-          </div>
-        </div>
-      </Modal>
     </div>
+
   );
 }
